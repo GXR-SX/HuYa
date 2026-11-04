@@ -33,7 +33,7 @@ huya_cookie.py              # Cookie 续期, 可单独运行自检
 1. 登录 [虎牙网页版](https://i.huya.com/index.php?m=Msg&do=getMsgC)
 2. 按 F12 打开开发者工具, 切到网络, 刷新页面
 3. 找到 `index.php?m=Msg&do=getMsgC` 这个请求
-4. 在请求头里复制完整的 Cookie 字符串
+4. 在请求头里复制完整的 Cookie 字符串, 务必确认不含换行, 且包含 `udb_biztoken` 和 `udb_cred` 字段
 
 ### 2. 获取 Server 酱 SendKey(可选)
 
