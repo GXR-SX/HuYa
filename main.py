@@ -10,8 +10,8 @@ import requests
 
 import gh_secret
 from huya_api import HuyaAPI
-from huya_cookie import (describe_cookie, drop_cookie_cache, load_cookie, parse_cookie,
-                         refresh_cookie, save_cookie_cache)
+from huya_cookie import (describe_cookie, load_cookie, parse_cookie, refresh_cookie,
+                         save_cookie_cache)
 
 COOKIE_DIR = ".huya_cookie"
 SYNC_REPORT = os.path.join(COOKIE_DIR, "sync.json")
@@ -162,6 +162,11 @@ class HuYaAuto:
         """续期是滑动的：拿到新 Cookie 立刻落盘 + 写回 Secret，晚一步就可能作废。"""
         if self.cookie_path:
             try:
+                # 旧值留一份：万一新链在写回 Secret 前就断了，还有东西可试
+                if os.path.exists(self.cookie_path):
+                    old = open(self.cookie_path, encoding="utf-8").read().strip()
+                    if old and old != self.cookie:
+                        save_cookie_cache(f"{self.cookie_path}.prev", old)
                 save_cookie_cache(self.cookie_path, self.cookie)
                 print(f"{self.tag}[COOKIE] 登录态已写入缓存: {self.cookie_path}")
             except Exception as e:
@@ -172,32 +177,42 @@ class HuYaAuto:
             if self.state.push():
                 print(f"{self.tag}[COOKIE] 已写回 GitHub Secret")
 
-    def _drop_cookie(self):
-        if self.cookie_path and drop_cookie_cache(self.cookie_path):
-            print(f"{self.tag}[COOKIE] 已删除失效缓存: {self.cookie_path}")
+    def _candidates(self):
+        """按可信度排序的候选 Cookie：当前 → 另一份(env/缓存) → 上一版。"""
+        cands = [(self.cookie, self.cookie_source)]
+        if self.cookie_source == "file" and self.cookie_seed:
+            cands.append((self.cookie_seed, "env"))
+        elif self.cookie_source == "env" and self.cookie_cache:
+            cands.append((self.cookie_cache, "file"))
+
+        if self.cookie_path:
+            prev_path = f"{self.cookie_path}.prev"
+            if os.path.exists(prev_path):
+                try:
+                    prev = open(prev_path, encoding="utf-8").read().strip()
+                except OSError:
+                    prev = ""
+                if prev:
+                    cands.append((prev, "上一版"))
+
+        out, seen = [], set()
+        for cookie, source in cands:
+            if cookie and cookie not in seen:
+                seen.add(cookie)
+                out.append((cookie, source))
+        return out
 
     def _refresh_cookie(self):
-        cookie, info = refresh_cookie(self.cookie, log=print)
-        if info:
-            self.passport = info.get("passport") or self.passport
-            return cookie
-
-        # 缓存续期失败时换另一份 Cookie 再试
-        if self.cookie_source == "file":
-            self._drop_cookie()
-            alt, alt_source = self.cookie_seed, "env"
-        else:
-            alt, alt_source = self.cookie_cache, "file"
-
-        if alt:
-            print(f"{self.tag}[COOKIE] 改用 {alt_source} Cookie 重试续期")
-            alt, info = refresh_cookie(alt, log=print)
+        for idx, (cookie, source) in enumerate(self._candidates()):
+            if idx:
+                print(f"{self.tag}[COOKIE] 改用 {source} Cookie 重试续期")
+            new_cookie, info = refresh_cookie(cookie, log=print)
             if info:
                 self.passport = info.get("passport") or self.passport
-                self.cookie_seed = self.cookie_cache = self.cookie = alt
-                self.cookie_source = "file"
+                if new_cookie != self.cookie:
+                    self.cookie = new_cookie
+                    self.cookie_source = source
                 return self.cookie
-
         return self.cookie
 
     # ---------------- 流程 ----------------

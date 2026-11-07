@@ -27,6 +27,7 @@ def visit_rooms(cookie, rooms, tag="", log=print):
         return False
 
     wait_ms = int(os.getenv("HUYA_ROOM_WAIT_MS", "10000") or 10000)
+    goto_timeout = int(os.getenv("HUYA_ROOM_TIMEOUT_MS", "20000") or 20000)
     chrome_path = os.getenv("HUYA_CHROME_PATH", "").strip()
     launch_args = {
         "headless": True,
@@ -51,18 +52,22 @@ def visit_rooms(cookie, rooms, tag="", log=print):
                     return False
 
                 for rid in rooms:
-                    page = context.new_page()
-                    try:
-                        page.goto(f"https://www.huya.com/{rid}",
-                                  wait_until="domcontentloaded", timeout=30000)
-                        page.wait_for_timeout(wait_ms)
-                        log(f"{tag}[ROOM] 已访问房间 {rid}")
-                        ok = True
-                    except Exception as e:
-                        log(f"{tag}[WARN] 房间 {rid} 访问失败: "
-                            f"{type(e).__name__}: {e}")
-                    finally:
-                        page.close()
+                    url = f"https://www.huya.com/{rid}"
+                    # 直播间页面资源很重，等 domcontentloaded 经常直接超时；
+                    # 用 commit（导航一提交就返回）再驻留，既快又不丢粉丝礼包
+                    for attempt in (1, 2):
+                        page = context.new_page()
+                        try:
+                            page.goto(url, wait_until="commit", timeout=goto_timeout)
+                            page.wait_for_timeout(wait_ms)
+                            log(f"{tag}[ROOM] 已访问房间 {rid}")
+                            ok = True
+                            break
+                        except Exception as e:
+                            log(f"{tag}[WARN] 房间 {rid} 访问失败(第 {attempt} 次): "
+                                f"{type(e).__name__}: {e}")
+                        finally:
+                            page.close()
             finally:
                 browser.close()
     except Exception as e:
