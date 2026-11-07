@@ -100,7 +100,9 @@ def load_cookie_cache(path, log=print):
     if os.path.exists(enc):
         try:
             with open(enc, encoding="utf-8") as f:
-                return decrypt_cookie(f.read()).strip()
+                text = decrypt_cookie(f.read()).strip()
+            log(f"[COOKIE] 已解密缓存 {os.path.basename(enc)}（{len(text)} 字节）")
+            return text
         except Exception as e:
             log(f"[COOKIE] 解密缓存失败: {type(e).__name__}: {e}")
     if os.path.exists(path):
