@@ -53,6 +53,7 @@ jobs:
           HUYA_COOKIES: ${{ secrets.HUYA_COOKIES }}
           GH_PAT: ${{ secrets.GH_PAT }}
           GH_REPO: ${{ github.repository }}
+          HUYA_COOKIE_BACKUP_KEY: ${{ secrets.HUYA_COOKIE_BACKUP_KEY }}
           HUYA_MODE: refresh
           HUYA_COOKIE_SYNC: '1'
           GH_SECRET_DRY_RUN: '0'
@@ -68,6 +69,12 @@ jobs:
           else
             echo "⚠️ 没有生成回写报告"
           fi
+
+      - name: 缓存内容审计
+        if: always()
+        run: |
+          echo "缓存目录内容（应只有 *.enc 密文）:"
+          ls -la .huya_cookie || true
 
       - name: 保存登录态缓存
         if: always()

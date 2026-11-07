@@ -216,6 +216,33 @@ on:
 
 ---
 
+## 安全性(公开仓库必读)
+
+仓库是公开的, 所以这里把边界说清楚:
+
+| 东西 | 存在哪 | 公开可见? |
+|------|--------|-----------|
+| Cookie 值 | Actions Secret `HUYA_COOKIE` | 否. Secret 只写, API 只返回名字, 值加密存储 |
+| 令牌 | Actions Secret `GH_PAT` | 否, 同上 |
+| 日志 | Actions 运行日志 | 只打印字段名和长度(如 `udb_biztoken(344)`), 从不打印值; Secret 值会被 GitHub 自动打码 |
+| 登录态缓存 | Actions 缓存 `.huya_cookie/*.enc` | 只有密文. 见下 |
+
+**缓存必须加密**: GitHub 官方文档明确警告「不要把敏感信息放进 Actions 缓存 —— 任何能对本仓库
+提 PR 的人都能读到 base 分支的缓存内容」。所以脚本用 `HUYA_COOKIE_BACKUP_KEY` 做
+`SecretBox` 加密后才落盘, 缓存里只有 `cookie.txt.enc`; 没配密钥时在 CI 里直接不落盘。
+
+**`GH_PAT` 的权限要收窄**:
+
+- 用 **Fine-grained token**, 只授权本仓库
+- Repository permissions 只勾 **Secrets: Read and write**(Metadata 会自动带上只读)
+- 设置 90 天过期, 到期换新
+- 不要用 Classic token 的 `repo` 全权限 —— 那等于把整个仓库的写权限交出去
+
+**另外**: 网页端和脚本不要同时用一个账号。浏览器每刷一次页面就会滚掉一次 `udb_cred`,
+脚本手里那份立刻作废, 这不是泄露, 是两边互相踢。
+
+---
+
 ## 常见问题
 
 - **登录失败**: 如果日志显示「续期成功」之后仍失败, 多半是网络问题; 如果显示「续期被拒绝」, 说明 Cookie 失效

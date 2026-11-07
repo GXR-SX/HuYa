@@ -10,8 +10,8 @@ import requests
 
 import gh_secret
 from huya_api import HuyaAPI
-from huya_cookie import (describe_cookie, load_cookie, parse_cookie, refresh_cookie,
-                         save_cookie_cache)
+from huya_cookie import (describe_cookie, load_cookie, load_cookie_cache, parse_cookie,
+                         refresh_cookie, save_cookie_cache)
 
 COOKIE_DIR = ".huya_cookie"
 SYNC_REPORT = os.path.join(COOKIE_DIR, "sync.json")
@@ -128,11 +128,8 @@ class HuYaAuto:
         self.cookie = ""
         self.health = None
 
-        if self.cookie_path and os.path.exists(self.cookie_path):
-            try:
-                self.cookie_cache = open(self.cookie_path, encoding="utf-8").read().strip()
-            except OSError as e:
-                print(f"{self.tag}[WARN] 读缓存失败: {type(e).__name__}: {e}")
+        if self.cookie_path:
+            self.cookie_cache = load_cookie_cache(self.cookie_path, log=print)
             if self.cookie_cache:
                 # 账号顺序变了的话缓存可能对不上，按 udb_uid 校验一下
                 cache_uid = parse_cookie(self.cookie_cache).get("udb_uid")
@@ -163,10 +160,9 @@ class HuYaAuto:
         if self.cookie_path:
             try:
                 # 旧值留一份：万一新链在写回 Secret 前就断了，还有东西可试
-                if os.path.exists(self.cookie_path):
-                    old = open(self.cookie_path, encoding="utf-8").read().strip()
-                    if old and old != self.cookie:
-                        save_cookie_cache(f"{self.cookie_path}.prev", old)
+                old = load_cookie_cache(self.cookie_path, log=print)
+                if old and old != self.cookie:
+                    save_cookie_cache(f"{self.cookie_path}.prev", old)
                 save_cookie_cache(self.cookie_path, self.cookie)
                 print(f"{self.tag}[COOKIE] 登录态已写入缓存: {self.cookie_path}")
             except Exception as e:
@@ -186,14 +182,9 @@ class HuYaAuto:
             cands.append((self.cookie_cache, "file"))
 
         if self.cookie_path:
-            prev_path = f"{self.cookie_path}.prev"
-            if os.path.exists(prev_path):
-                try:
-                    prev = open(prev_path, encoding="utf-8").read().strip()
-                except OSError:
-                    prev = ""
-                if prev:
-                    cands.append((prev, "上一版"))
+            prev = load_cookie_cache(f"{self.cookie_path}.prev", log=print)
+            if prev:
+                cands.append((prev, "上一版"))
 
         out, seen = [], set()
         for cookie, source in cands:

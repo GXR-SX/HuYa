@@ -99,6 +99,7 @@ jobs:
           SEND_KEY: ${{ secrets.SEND_KEY }}
           GH_PAT: ${{ secrets.GH_PAT }}
           GH_REPO: ${{ github.repository }}
+          HUYA_COOKIE_BACKUP_KEY: ${{ secrets.HUYA_COOKIE_BACKUP_KEY }}
           HUYA_COOKIE_SYNC: '1'
           GH_SECRET_DRY_RUN: '0'
         run: |
@@ -118,11 +119,17 @@ jobs:
         id: check-cookie
         if: always()
         run: |
-          if find .huya_cookie -name "*.txt" -type f | grep -q .; then
+          if find .huya_cookie -type f | grep -q .; then
             echo "exists=true" >> $GITHUB_OUTPUT
           else
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
+
+      - name: POST:缓存内容审计
+        if: always()
+        run: |
+          echo "缓存目录内容（应只有 *.enc 密文）:"
+          ls -la .huya_cookie || true
 
       - name: POST:保存登录态缓存
         if: always() && steps.check-cookie.outputs.exists == 'true'

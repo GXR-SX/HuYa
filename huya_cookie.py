@@ -38,6 +38,11 @@ import requests
 DEFAULT_COOKIE_ENV = "HUYA_COOKIE"
 DEFAULT_COOKIE_FILE = ".huya_cookie/cookie.txt"
 
+# 缓存里绝不能放明文 Cookie：公开仓库的 Actions 缓存，任何人开一个 PR 就能用
+# actions/cache/restore 把 base 分支的缓存读出来（GitHub 官方文档明确警告）。
+# 所以缓存落盘前先用这个密钥做 SecretBox 加密，密钥只存在 Secrets 里。
+CACHE_KEY_ENV = "HUYA_COOKIE_BACKUP_KEY"
+
 # 复刻自 udb.sdk.web.js 中 credLogin() 的默认参数（已对照线上 SDK 校验）
 CRED_LOGIN_URL = "https://udblgn.huya.com/web/credLogin"
 UDB_APPID = "5002"
@@ -63,49 +68,102 @@ def parse_cookie(cookie_str):
     return out
 
 
-def load_cookie(log=print):
-    """载入 Cookie：返回 (环境变量值, 缓存文件值, 缓存文件路径)。"""
-    cookie_env = os.getenv(DEFAULT_COOKIE_ENV, "").strip()
-    cookie_cache = ""
+def _cache_key():
+    raw = os.getenv(CACHE_KEY_ENV, "").strip()
+    if not raw:
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).digest()
 
-    if os.path.exists(DEFAULT_COOKIE_FILE):
+
+def encrypt_cookie(cookie):
+    """有密钥就返回密文，没有就返回 None（此时不落盘，避免明文进缓存）。"""
+    key = _cache_key()
+    if not key:
+        return None
+    from nacl.secret import SecretBox
+    return base64.b64encode(SecretBox(key).encrypt(cookie.encode("utf-8"))).decode("ascii")
+
+
+def decrypt_cookie(blob):
+    key = _cache_key()
+    if not key:
+        raise RuntimeError(f"缺少 {CACHE_KEY_ENV}，无法解密缓存")
+    from nacl.secret import SecretBox
+    return SecretBox(key).decrypt(base64.b64decode((blob or "").strip())).decode("utf-8")
+
+
+def load_cookie_cache(path, log=print):
+    """读取缓存：优先 .enc（加密），兼容旧的明文文件。"""
+    if not path:
+        return ""
+    enc = f"{path}.enc"
+    if os.path.exists(enc):
         try:
-            cookie_cache = open(DEFAULT_COOKIE_FILE, encoding="utf-8").read().strip()
+            with open(enc, encoding="utf-8") as f:
+                return decrypt_cookie(f.read()).strip()
+        except Exception as e:
+            log(f"[COOKIE] 解密缓存失败: {type(e).__name__}: {e}")
+    if os.path.exists(path):
+        try:
+            return open(path, encoding="utf-8").read().strip()
         except OSError as e:
             log(f"[COOKIE] 读取缓存文件失败: {type(e).__name__}: {e}")
+    return ""
 
+
+def load_cookie(log=print):
+    """载入 Cookie：返回 (环境变量值, 缓存值, 缓存文件路径)。"""
+    cookie_env = os.getenv(DEFAULT_COOKIE_ENV, "").strip()
+    cookie_cache = load_cookie_cache(DEFAULT_COOKIE_FILE, log=log)
     return (cookie_env, cookie_cache, DEFAULT_COOKIE_FILE)
 
 
 def drop_cookie_cache(path, log=print):
-    """丢弃缓存文件。"""
+    """丢弃缓存文件（明文与密文一起删）。"""
     if not path:
         return False
-    try:
-        os.remove(path)
-        return True
-    except FileNotFoundError:
-        return False
-    except OSError as e:
-        log(f"[WARN] 删除缓存文件失败: {type(e).__name__}: {e}")
-        return False
+    removed = False
+    for target in (path, f"{path}.enc"):
+        try:
+            os.remove(target)
+            removed = True
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            log(f"[WARN] 删除缓存文件失败: {type(e).__name__}: {e}")
+    return removed
 
 
 def save_cookie_cache(path, cookie):
-    """保存缓存文件（先写临时文件再原子替换，避免半截内容）。"""
+    """保存缓存：有密钥就只写密文 .enc，并删掉可能残留的明文。"""
     if not path:
         return None
     path = os.path.abspath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp"
+
+    blob = encrypt_cookie(cookie)
+    if blob is None and os.getenv("GITHUB_ACTIONS") == "true":
+        # CI 里没配密钥就不落盘：宁可不缓存，也不能把明文塞进 Actions 缓存
+        return None
+    target = f"{path}.enc" if blob else path
+    payload = blob if blob else cookie
+
+    tmp = f"{target}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write(cookie)
-    os.replace(tmp, path)
+        f.write(payload)
+    os.replace(tmp, target)
     try:
-        os.chmod(path, 0o600)
+        os.chmod(target, 0o600)
     except OSError:
         pass
-    return path
+
+    if blob:  # 加密模式：清掉旧明文
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return target
+
 
 
 def format_cookie(cookies):
