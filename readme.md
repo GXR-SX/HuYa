@@ -18,10 +18,15 @@
 ## 项目结构
 
 ```
-.github/workflows/auto.yml  # GitHub Actions 配置
-requirements.txt            # 依赖清单
-main.py                     # 主程序
-huya_cookie.py              # Cookie 续期, 可单独运行自检
+.github/workflows/auto.yml      # GitHub Actions 配置(送礼/打卡)
+.github/workflows/keepalive.yml # 每 12 小时只续期 + 回写 Secret
+requirements.txt                # 依赖清单
+main.py                         # 主程序
+huya_cookie.py                  # Cookie 续期与体检, 可单独运行自检
+gh_secret.py                    # 把新 Cookie 写回 Actions Secrets
+room_visit.py                   # 房间页访问(粉丝礼包)
+tools/cookie_doctor.py          # Cookie 体检(只打印字段名和长度)
+tools/capture_cookie.py         # 本地抓取完整 Cookie(含 HttpOnly)
 ```
 
 ---
@@ -50,8 +55,23 @@ huya_cookie.py              # Cookie 续期, 可单独运行自检
    - `HUYA_COOKIES`: 多账号使用, 每行一个 Cookie, 设了它就忽略 `HUYA_COOKIE`
    - `HUYA_ROOMS`: 房间号列表, 英文逗号分隔, 例如 `518512,1964,294636272`, 必须
    - `SEND_KEY`: Server 酱 SendKey, 可选
+   - `GH_PAT`: **必填**, 用于把续期后的新 Cookie 写回 Secrets, 见下一节
 4. 进入 **Actions**, 启用工作流
-5. 默认每天北京时间 07:17 自动运行
+5. 默认每天北京时间 07:17 自动运行, 另外每 12 小时有一次纯续期
+
+### 4. 配置 GH_PAT(让 Cookie 自己续命)
+
+虎牙的 `udb_cred` 是**滚动失效**的: 每续期一次, 上一份立刻作废。所以脚本必须把
+新 Cookie 写回 Secret, 否则下一轮读到的还是旧快照, 直接 `40002 登录失败` ——
+这就是"新 Cookie 只活很短"的根源。
+
+1. 打开 https://github.com/settings/tokens
+2. **Fine-grained token**: 选择本仓库 → Repository permissions → **Secrets: Read and write**
+   (或者用 Classic token, 勾 `repo` + `workflow`)
+3. 复制令牌, 加到仓库 Secret `GH_PAT`
+
+脚本只用它做一件事: `PUT /repos/{owner}/{repo}/actions/secrets/{name}`,
+写入前用仓库公钥做 libsodium sealed box 加密, 和网页端行为一致。
 
 ---
 
@@ -86,6 +106,10 @@ python main.py
 | HUYA_COOKIES | 多账号 Cookie, 每行一个, 优先于 HUYA_COOKIE |
 | HUYA_ROOMS | 目标房间号列表, 必须 |
 | SEND_KEY | Server 酱 SendKey, 可选 |
+| GH_PAT | 写回 Secret 用的令牌, 需要 Secrets 写权限 |
+| HUYA_COOKIE_SYNC | 设为 0 时关闭 Secret 回写, 默认开启 |
+| GH_SECRET_DRY_RUN | 设为 1 时只演练回写, 不真正写 |
+| HUYA_MODE | 设为 refresh 时只续期, 不送礼/打卡 |
 | HUYA_SEND_DRY_RUN | 设为 1 时只演练流程, 不真正赠送 |
 | HUYA_CLAIM_FANS_BOX | 设为 0 时关闭固定 10 粉丝盒领取, 默认开启 |
 
@@ -102,17 +126,48 @@ python main.py
 
 ---
 
-## 关于 Cookie 续期
+## 关于 Cookie 续期(重点)
 
-虎牙登录态里有两个关键 Cookie: `udb_biztoken` 负责接口鉴权, 寿命较短；`udb_cred` 是长期凭证, 寿命 180 天. 网页端会在 `udb_biztoken` 失效时用 `udb_cred` 自动换新, 同时滚动 `udb_cred` 本身.
+虎牙登录态由两个 Cookie 组成:
 
-本工具复刻了这个续期请求, 每次运行前自动续期, 再用新的 Cookie 继续后续操作. 续期后的 Cookie 使用 **Actions 缓存**保存, 缓存 7 天没访问会被清理, 每天跑一次就不会过期.
+| Cookie | 作用 | 寿命 |
+|--------|------|------|
+| `udb_biztoken` | 接口鉴权真正看的东西 | 约 15 天(部分场景 7 天) |
+| `udb_cred` | 长期凭证, 用来换新 biztoken, **HttpOnly** | 约 180 天 |
+
+网页端并不是"永不过期", 而是每次访问时前端 SDK 发现 `udb_cred` 在、`udb_biztoken` 缺失,
+就静默 `POST https://udblgn.huya.com/web/credLogin` 换一套新的, 顺便把 `udb_cred` 也滚成新的。
+
+**关键: 每次续期都会让上一份 `udb_cred` 作废。** 所以:
+
+1. 续期后的 Cookie 必须立刻持久化 —— 本工具会写回 `HUYA_COOKIE` / `HUYA_COOKIES` 这个 Secret
+   (需要 `GH_PAT`), 同时留一份 Actions 缓存兜底;
+2. 只有 Secret 更新了, 下一次运行才拿得到还在有效期内的那一份;
+3. 以前的版本只写缓存、不写 Secret, 手动运行还会删缓存 —— 等于每次都退回那张已经被轮换
+   作废的旧快照, 表现就是"新 Cookie 只能活很短"。
+
+另外, 缓存续期失败时会自动换另一份 Cookie 再试, 所以 `.huya_cookie` 缓存和 Secret
+任何一边是好的都能救回来。
 
 本地可以单独测试续期是否正常:
 
 ```bash
 HUYA_COOKIE="你的Cookie" python huya_cookie.py
 ```
+
+体检当前 Cookie(只打印字段名和长度, 不泄露值):
+
+```bash
+HUYA_COOKIE="你的Cookie" python tools/cookie_doctor.py
+```
+
+`udb_cred` 缺失时的补救办法:
+
+- DevTools → **Application → Cookies → https://www.huya.com**, 把整张表里的
+  `udb_uid` / `udb_biztoken` / `udb_cred` 都拼进 Cookie 字符串(不要用 `document.cookie`,
+  它读不到 HttpOnly);
+- 或者直接跑 `python tools/capture_cookie.py`: 打开真实浏览器登录一次, 脚本从
+  cookie jar 里读出完整 Cookie(含 HttpOnly), 并直接写回 Secret。
 
 ---
 
@@ -131,12 +186,13 @@ on:
 ## 运行流程
 
 1. 检查 Cookie 和房间号, 缺失就退出
-2. 读取背包虎粮数量
-3. 把虎粮分配到所有房间
-4. 依次进房间, 送出虎粮
-5. 房间打卡
-6. 输出结果
-7. 如果配了 SEND_KEY, 推送结果到微信
+2. 用 `udb_cred` 续期, 拿到新 Cookie 后**立刻**写回 Secret 并落缓存
+3. 读取背包虎粮数量
+4. 把虎粮分配到所有房间
+5. 依次进房间, 送出虎粮
+6. 房间打卡
+7. 输出结果
+8. 如果配了 SEND_KEY, 推送结果到微信
 
 ---
 
@@ -163,9 +219,16 @@ on:
 ## 常见问题
 
 - **登录失败**: 如果日志显示「续期成功」之后仍失败, 多半是网络问题; 如果显示「续期被拒绝」, 说明 Cookie 失效
+- **新 Cookie 只活一两天**: 看体检输出。没有 `udb_cred` 就无法续期, 只能撑到 `udb_biztoken` 到期;
+  有 `udb_cred` 但很快失效, 通常是**浏览器和脚本在抢同一份登录态** —— 浏览器每刷一次页面就会
+  滚掉一次 `udb_cred`, 脚本手里那份立刻作废。导出/抓取之后退出浏览器登录, 或者用一个
+  专用浏览器配置文件, 只给脚本用
+- **Secret 没更新**: 日志里出现 `[SECRET] 写入 xxx 失败 HTTP 403` 说明 `GH_PAT` 没有
+  Secrets 写权限(fine-grained 要勾 Repository permissions → Secrets: Read and write);
+  `401` 说明令牌过期
 - **赠送失败**: 大概率网络问题, 稍等一会儿再跑一次
 - **打卡失败**: 确认这个房间有没有加入粉丝团
-- **Action 报错**: 检查 Secrets 是否配置正确
+- **Action 报错**: 检查 Secrets 是否配置正确; `POST:回写报告` 那一步会打印同步结果
 
 ---
 

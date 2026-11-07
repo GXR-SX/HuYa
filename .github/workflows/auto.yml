@@ -10,15 +10,17 @@ on:
         required: false
         default: ''
 
+# 和 keepalive.yml 共用同一把锁：Cookie 是「滚动失效」的，两个任务绝不能同时续期
+concurrency:
+  group: huya-cookie
+  cancel-in-progress: false
+
 jobs:
   send-hl:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    concurrency:
-      group: huya-huliang
-      cancel-in-progress: false
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: 检出代码
@@ -41,8 +43,9 @@ jobs:
       - name: 安装 Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: PRE:恢复登录态缓存(仅自动运行)
-        if: github.event_name == 'schedule'
+      # 手动触发也必须恢复缓存：缓存放的是上一轮续期后的最新 Cookie，
+      # 删掉它等于主动退回那张已经被轮换作废的旧快照。
+      - name: PRE:恢复登录态缓存
         uses: actions/cache/restore@v4
         with:
           path: .huya_cookie
@@ -50,22 +53,14 @@ jobs:
           restore-keys: |
             huya-cookie-
 
-      - name: PRE:检查登录态缓存
+      - name: PRE:检查登录态
         env:
           HUYA_COOKIE: ${{ secrets.HUYA_COOKIE }}
           HUYA_COOKIES: ${{ secrets.HUYA_COOKIES }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ -z "$HUYA_COOKIE" ] && [ -z "$HUYA_COOKIES" ]; then
-              echo "❌ 手动运行必须配置 HUYA_COOKIE 或 HUYA_COOKIES"
-              exit 1
-            fi
-          else
-            if [ -z "$HUYA_COOKIE" ] && [ -z "$HUYA_COOKIES" ] && ! ls .huya_cookie/*.txt >/dev/null 2>&1; then
-              echo "❌ 自动运行:未配置 Cookie, 且缓存中没有可用登录态"
-              exit 1
-            fi
+          if [ -z "$HUYA_COOKIE" ] && [ -z "$HUYA_COOKIES" ] && ! ls .huya_cookie/*.txt >/dev/null 2>&1; then
+            echo "❌ 未配置 Cookie，且缓存中没有可用登录态"
+            exit 1
           fi
 
       - name: PRE:获取房间号
@@ -88,27 +83,40 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
+      - name: PRE:Cookie 体检
+        env:
+          HUYA_COOKIE: ${{ secrets.HUYA_COOKIE }}
+          HUYA_COOKIES: ${{ secrets.HUYA_COOKIES }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+        run: python tools/cookie_doctor.py
+
       - name: 运行虎粮发放
         env:
           HUYA_COOKIE: ${{ secrets.HUYA_COOKIE }}
           HUYA_COOKIES: ${{ secrets.HUYA_COOKIES }}
           HUYA_ROOMS: ${{ steps.get-rooms.outputs.rooms }}
           SEND_KEY: ${{ secrets.SEND_KEY }}
-          EVENT_NAME: ${{ github.event_name }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          HUYA_COOKIE_SYNC: '1'
+          GH_SECRET_DRY_RUN: '0'
         run: |
           mkdir -p .huya_cookie
-
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "手动运行:强制使用 Secrets 里的 Cookie, 忽略缓存文件"
-            rm -f .huya_cookie/*.txt
-          fi
-
           python main.py
-          echo "✅ 虎粮发放完成"
+
+      - name: POST:回写报告
+        if: always()
+        run: |
+          if [ -f .huya_cookie/sync.json ]; then
+            cat .huya_cookie/sync.json
+          else
+            echo "⚠️ 没有生成回写报告（任务可能在登录前就中断了）"
+          fi
 
       - name: POST:检查登录态缓存
         id: check-cookie
-        if: always() # 即使前面失败也要检查
+        if: always()
         run: |
           if find .huya_cookie -name "*.txt" -type f | grep -q .; then
             echo "exists=true" >> $GITHUB_OUTPUT

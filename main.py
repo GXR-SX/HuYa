@@ -1,21 +1,91 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
 import os
 import random
 import time
 
 import requests
 
+import gh_secret
 from huya_api import HuyaAPI
-from huya_cookie import (drop_cookie_cache, load_cookie, parse_cookie, refresh_cookie,
-                         save_cookie_cache)
+from huya_cookie import (describe_cookie, drop_cookie_cache, load_cookie, parse_cookie,
+                         refresh_cookie, save_cookie_cache)
 
 COOKIE_DIR = ".huya_cookie"
+SYNC_REPORT = os.path.join(COOKIE_DIR, "sync.json")
 
 
 def _pause(a, b):
     time.sleep(random.uniform(a, b))
+
+
+def _env_flag(name, default="1"):
+    return os.getenv(name, default).strip() not in ("0", "", "false", "False")
+
+
+class SecretSync:
+    """一次运行内同一个值只写一次，避免重复 PUT。"""
+
+    def __init__(self, log=print):
+        self.log = log
+        self.done = {}
+        self.report = {"updated": [], "failed": {}, "skipped": [], "errors": []}
+        self.enabled = _env_flag("HUYA_COOKIE_SYNC", "1") and bool(gh_secret.get_token()[0])
+        if not self.enabled:
+            token, _ = gh_secret.get_token()
+            reason = "HUYA_COOKIE_SYNC=0" if not _env_flag("HUYA_COOKIE_SYNC", "1") else "未配置 GH_PAT"
+            self.log(f"[SECRET] 跳过回写（{reason}）")
+
+    def push(self, updates):
+        updates = {k: (v or "").strip() for k, v in (updates or {}).items()}
+        updates = {k: v for k, v in updates.items() if v and self.done.get(k) != v}
+        if not updates:
+            return True
+        if not self.enabled:
+            self.report["skipped"].extend(updates)
+            return False
+        report = gh_secret.sync(updates, log=self.log,
+                                dry_run=os.getenv("GH_SECRET_DRY_RUN", "").strip() == "1")
+        for name in report.get("updated", []):
+            self.done[name] = updates.get(name, "")
+            if name not in self.report["updated"]:
+                self.report["updated"].append(name)
+        for name, err in (report.get("failed") or {}).items():
+            self.report["failed"][name] = err
+        if report.get("error"):
+            self.report["errors"].append(report["error"])
+        return report.get("ok", False)
+
+    def dump(self):
+        try:
+            os.makedirs(COOKIE_DIR, exist_ok=True)
+            with open(SYNC_REPORT, "w", encoding="utf-8") as f:
+                json.dump(self.report, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            self.log(f"[SECRET][WARN] 写同步报告失败: {type(e).__name__}: {e}")
+
+
+class AccountState:
+    """所有账号的「当前最优 Cookie」，用于拼 HUYA_COOKIES / HUYA_COOKIE。"""
+
+    def __init__(self, accounts, sync):
+        self.sync = sync
+        self.multi = bool(os.getenv("HUYA_COOKIES", "").strip())
+        self.items = [{"label": a["label"], "cookie": a["seed"]} for a in accounts]
+
+    def update(self, index, cookie):
+        if cookie:
+            self.items[index]["cookie"] = cookie
+
+    def secrets(self):
+        if self.multi:
+            return {"HUYA_COOKIES": "\n".join(i["cookie"] for i in self.items if i["cookie"])}
+        return {"HUYA_COOKIE": self.items[0]["cookie"] if self.items else ""}
+
+    def push(self):
+        return self.sync.push(self.secrets())
 
 
 def build_accounts():
@@ -32,12 +102,12 @@ def build_accounts():
 
 
 def parse_rooms(text):
-    return [int(s) for s in text.replace(" ", "").split(",") if s.isdigit()]
+    return [int(s) for s in (text or "").replace(" ", "").split(",") if s.isdigit()]
 
 
 class HuYaAuto:
     def __init__(self, account, rooms, dry_run=False, claim_fans_box=True,
-                 visit_rooms=True):
+                 visit_rooms=True, state=None, index=0, refresh_only=False):
         self.label = account["label"]
         self.tag = f"[{self.label}] " if self.label else ""
         self.cookie_seed = account["seed"]
@@ -46,12 +116,17 @@ class HuYaAuto:
         self.dry_run = dry_run
         self.enable_fans_box = claim_fans_box
         self.enable_room_visit = visit_rooms
+        self.refresh_only = refresh_only
+        self.state = state
+        self.index = index
         self.msg_logs = []
         self.passport = ""
         self.api = None
+        self.login_ok = False
         self.cookie_source = "env"
         self.cookie_cache = ""
         self.cookie = ""
+        self.health = None
 
         if self.cookie_path and os.path.exists(self.cookie_path):
             try:
@@ -75,14 +150,19 @@ class HuYaAuto:
 
     # ---------------- Cookie ----------------
 
-    def _save_cookie(self, cookie, changed):
-        if not changed or not self.cookie_path:
-            return
-        try:
-            save_cookie_cache(self.cookie_path, cookie)
-            print(f"{self.tag}[COOKIE] 登录态已写入缓存: {self.cookie_path}")
-        except Exception as e:
-            print(f"{self.tag}[WARN] 写缓存失败: {type(e).__name__}: {e}")
+    def persist_cookie(self):
+        """续期是滑动的：拿到新 Cookie 立刻落盘 + 写回 Secret，晚一步就可能作废。"""
+        if self.cookie_path:
+            try:
+                save_cookie_cache(self.cookie_path, self.cookie)
+                print(f"{self.tag}[COOKIE] 登录态已写入缓存: {self.cookie_path}")
+            except Exception as e:
+                print(f"{self.tag}[WARN] 写缓存失败: {type(e).__name__}: {e}")
+
+        if self.state is not None:
+            self.state.update(self.index, self.cookie)
+            if self.state.push():
+                print(f"{self.tag}[COOKIE] 已写回 GitHub Secret")
 
     def _drop_cookie(self):
         if self.cookie_path and drop_cookie_cache(self.cookie_path):
@@ -108,6 +188,7 @@ class HuYaAuto:
                 self.passport = info.get("passport") or self.passport
                 self.cookie_seed = self.cookie_cache = self.cookie = alt
                 self.cookie_source = "file"
+                return self.cookie
 
         return self.cookie
 
@@ -115,9 +196,13 @@ class HuYaAuto:
 
     def login(self):
         print(f"{self.tag}[LOGIN] 正在登录...")
+        self.health = describe_cookie(self.cookie, tag=self.tag)
         old_cookie = self.cookie
         self.cookie = self._refresh_cookie()
-        self._save_cookie(self.cookie, changed=self.cookie != old_cookie)
+
+        # 只要续期产生了新值就立刻持久化（cred 是滚动失效的）
+        if self.cookie != old_cookie:
+            self.persist_cookie()
 
         self.api = HuyaAPI(self.cookie, passport=self.passport)
         if self.api.uid <= 0:
@@ -129,6 +214,9 @@ class HuYaAuto:
                 print(f"{self.tag}[SUCCESS] 登录成功 (uid={self.api.uid})")
                 if not self.api.passport:
                     print(f"{self.tag}[WARN] 未取到 passport，送礼可能失败")
+                # 即使 Cookie 没变也写一次：保证 Secret 与本地缓存/实际使用的一致
+                self.persist_cookie()
+                self.login_ok = True
                 _pause(0.5, 1.5)
                 return True
             if i == 0:
@@ -283,6 +371,10 @@ class HuYaAuto:
             self.msg_logs.append("登录失败")
             return
 
+        if self.refresh_only:
+            self.msg_logs.append("仅续期，未执行送礼/打卡")
+            return
+
         self.visit_rooms()
         if self.enable_fans_box:
             self.claim_fans_boxes()
@@ -330,8 +422,10 @@ def send_notification(send_key, logs):
 
 
 def main():
+    mode = os.getenv("HUYA_MODE", "").strip().lower()
+    refresh_only = mode in ("refresh", "keepalive", "refresh-only")
     rooms = parse_rooms(os.getenv("HUYA_ROOMS", ""))
-    if not rooms:
+    if not rooms and not refresh_only:
         print("[ERROR] 未设置 HUYA_ROOMS")
         raise SystemExit(1)
 
@@ -339,20 +433,43 @@ def main():
     dry_run = os.getenv("HUYA_SEND_DRY_RUN", "").strip() == "1"
     claim_fans_box = os.getenv("HUYA_CLAIM_FANS_BOX", "1").strip() != "0"
     visit_rooms = os.getenv("HUYA_VISIT_ROOMS", "1").strip() != "0"
-    print(f"[INFO] 共 {len(accounts)} 个账号，房间 {rooms}，"
+
+    sync = SecretSync()
+    state = AccountState(accounts, sync)
+    print(f"[INFO] 模式={'仅续期' if refresh_only else '送礼+打卡'}，"
+          f"共 {len(accounts)} 个账号，房间 {rooms}，"
           f"粉丝盒{'开启' if claim_fans_box else '关闭'}，"
-          f"房间访问{'开启' if visit_rooms else '关闭'}")
+          f"房间访问{'开启' if visit_rooms else '关闭'}，"
+          f"Secret 回写{'开启' if sync.enabled else '关闭'}")
 
     logs = []
-    for account in accounts:
-        bot = HuYaAuto(account, rooms, dry_run, claim_fans_box, visit_rooms)
+    ok_count = 0
+    for idx, account in enumerate(accounts):
+        bot = HuYaAuto(account, rooms, dry_run, claim_fans_box, visit_rooms,
+                       state=state, index=idx, refresh_only=refresh_only)
         bot.run()
+        if bot.login_ok:
+            ok_count += 1
         label = account["label"]
         logs.extend(f"{label}: {m}" if label else m for m in bot.msg_logs)
         if len(accounts) > 1:
             _pause(8, 15)
 
-    send_notification(os.getenv("SEND_KEY", "").strip(), logs)
+    # 收尾再写一次，确保最后一张 Cookie 也进了 Secret
+    state.push()
+    sync.dump()
+
+    print(f"[INFO] 登录成功 {ok_count}/{len(accounts)}，"
+          f"Secret 已更新: {', '.join(sync.report['updated']) or '无'}")
+    if sync.report["failed"]:
+        print(f"[WARN] Secret 写入失败: {json.dumps(sync.report['failed'], ensure_ascii=False)}")
+
+    if not refresh_only:
+        send_notification(os.getenv("SEND_KEY", "").strip(), logs)
+
+    if ok_count == 0:
+        print("[ERROR] 全部账号登录失败：Cookie 已失效，需要重新导出（见 readme）")
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

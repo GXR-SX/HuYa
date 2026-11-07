@@ -1,0 +1,77 @@
+name: 虎牙登录态保活
+
+# 只做一件事：用 udb_cred 换一张新的 udb_biztoken，然后写回 Secret。
+# 送礼/打卡任务万一失败（接口改了、房间号错了），登录态也不会跟着断。
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: huya-cookie
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装 Python 包
+        run: pip install -r requirements.txt
+
+      - name: 恢复登录态缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: .huya_cookie
+          key: huya-cookie-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            huya-cookie-
+
+      - name: Cookie 体检
+        env:
+          HUYA_COOKIE: ${{ secrets.HUYA_COOKIE }}
+          HUYA_COOKIES: ${{ secrets.HUYA_COOKIES }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+        run: python tools/cookie_doctor.py
+
+      - name: 续期并写回 Secret
+        env:
+          HUYA_COOKIE: ${{ secrets.HUYA_COOKIE }}
+          HUYA_COOKIES: ${{ secrets.HUYA_COOKIES }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          HUYA_MODE: refresh
+          HUYA_COOKIE_SYNC: '1'
+          GH_SECRET_DRY_RUN: '0'
+        run: |
+          mkdir -p .huya_cookie
+          python main.py
+
+      - name: 回写报告
+        if: always()
+        run: |
+          if [ -f .huya_cookie/sync.json ]; then
+            cat .huya_cookie/sync.json
+          else
+            echo "⚠️ 没有生成回写报告"
+          fi
+
+      - name: 保存登录态缓存
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .huya_cookie
+          key: huya-cookie-${{ github.run_id }}-${{ github.run_attempt }}
