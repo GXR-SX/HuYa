@@ -148,6 +148,14 @@ class HuYaAuto:
         if not self.cookie:
             self.cookie = self.cookie_seed
 
+        # 缓存可能是旧版本写下的「没有 udb_cred」的快照，而 Secret 里有 —— 别用坏的
+        if self.cookie and self.cookie_seed and self.cookie_source == "file":
+            if (parse_cookie(self.cookie_seed).get("udb_cred")
+                    and not parse_cookie(self.cookie).get("udb_cred")):
+                print(f"{self.tag}[COOKIE] 缓存缺少 udb_cred，改用 Secret 里的 Cookie")
+                self.cookie = self.cookie_seed
+                self.cookie_source = "env"
+
     # ---------------- Cookie ----------------
 
     def persist_cookie(self):
@@ -203,6 +211,7 @@ class HuYaAuto:
         # 只要续期产生了新值就立刻持久化（cred 是滚动失效的）
         if self.cookie != old_cookie:
             self.persist_cookie()
+            describe_cookie(self.cookie, tag=f"{self.tag}[续期后]")
 
         self.api = HuyaAPI(self.cookie, passport=self.passport)
         if self.api.uid <= 0:
